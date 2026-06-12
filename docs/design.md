@@ -224,9 +224,14 @@ unconditional pass-through. On your three specifics:
 2. **Translate the input-page GPA L2 to L1 in KVM, and filter pages removed from
    the L2 root's GPA space.** Done. `kvm_hv_hypercall` now translates the relayed
    synic post's input GPA L2->L1 for `HVCALL_POST_MESSAGE` and the slow
-   `HVCALL_SIGNAL_EVENT`, gated on `!hc.fast && is_guest_mode(vcpu)`, reusing
+   `HVCALL_SIGNAL_EVENT`, gated on `!hc.fast && mmu_is_nested(vcpu)`, reusing
    `kvm_x86_ops.nested_ops->translate_nested_gpa(..., PFERR_GUEST_FINAL_MASK, ...)`
-   exactly as the L2 TLB-flush slow path does. A page removed from the L2 root's
+   exactly as the L2 TLB-flush slow path does. The guard is `mmu_is_nested()`, not
+   `is_guest_mode()`: `translate_nested_gpa()` opens with `BUG_ON(!mmu_is_nested())`,
+   and with shadow paging (no nested EPT) the L2 GPA is already an L1 GPA, so the
+   translation is both unsafe to call and unnecessary there. (Current `kvm-x86/next`
+   uses the same `mmu_is_nested()` guard on the TLB-flush path; older trees still say
+   `is_guest_mode()`.) A page removed from the L2 root's
    GPA space faults in the walk and returns `INVALID_GPA`, which we reject with
    `HV_STATUS_INVALID_HYPERCALL_INPUT` (the confidential-page filter comes for
    free). Confirmed the L2 root is identity-mapped on our boot (storvsp issues
@@ -248,9 +253,39 @@ unconditional pass-through. On your three specifics:
    existing userspace-post design, not something the relay introduces). A concurrent
    stage-2 flush serializes on the MMU lock against the actual page operation, and
    the faulting vCPU cannot flush mid-hypercall, so the translated L1 GPA stays
-   valid for the read. Closing even that window would mean reading the message
-   in-kernel under the MMU lock and handing userspace the bytes instead of the GPA,
-   an OpenVMM/KVM ABI change beyond what this relay needs; noted as a follow-up.
+   valid for the read.
+
+### Open question: do we need the in-kernel `HvPostMessage` read at all?
+
+The "safe design" you sketched ends with "translate and read synchronously ...
+hand userspace the data." For `HvSignalEvent` we already do (KVM reads it in the
+exit). For `HvPostMessage`, KVM hands userspace the translated L1 GPA and the VMM
+reads the message after the exit, which is exactly what KVM does for a *non-nested*
+post today. Fully matching the sketch means KVM reads the up-to-240-byte payload
+in-kernel under the MMU lock and ships the bytes to userspace, which needs a new
+`struct kvm_hyperv_exit` field (the payload does not fit in `params[2]`) plus a
+matching VMM change. Before doing that, the question we want your read on:
+
+**Is the post-exit userspace read actually a risk here, or only a tidiness item?**
+Our analysis says it is not a security risk:
+
+* The address handed to userspace is an **L1 GPA**. It always resolves through the
+  guest's own memslots, so even a stale read stays inside the guest's own memory.
+  There is no path to host memory or another VM.
+* For the read to be stale, the L1 (hvix64) would have to remap the exact L1 page
+  backing an `HvPostMessage` it just issued, in the window before its own reply is
+  delivered. A guest does not pull the page out from under a synic message it is
+  waiting on; a malicious guest that did so would only corrupt **its own** post.
+* The VMM's vmbus server validates the message (connection id, length) and a bad
+  one is dropped or mis-routed *within the guest's own vmbus namespace*, with no
+  effect on the host or other guests.
+* This is identical to the non-nested `HvPostMessage` userspace exit that ships in
+  KVM today; the relay adds a benign extra translation layer, not a new risk class.
+
+So our position is that the synchronous, uncached translation is sufficient and the
+in-kernel read is a tidiness improvement, not a correctness or security fix. If you
+disagree, or if upstream would want the in-kernel read as a condition of merge, we
+will add it (KVM side plus the VMM consumer). Which way do you want it?
 
 Your other question, "why doesn't the ordinary vmbus init path work once you
 handle the nested bit, since it works on Hyper-V-on-Hyper-V": it does work now
@@ -291,3 +326,36 @@ InitiateContact, KVM relays it, and OpenVMM's vmbus server answers.
 - Guest: a stock Hyper-V/VBS-enabled Windows 11 image with the usual Hyper-V
   boot-start drivers (storvsc/vmbus/netvsc), the same image that runs non-nested.
   No driver patch, no test-signing; Secure Boot on is fine.
+
+## Part 6: where the code lives, and a request
+
+The KVM change is published as two public repositories so you can read, build, and
+comment on it directly:
+
+| Repo | What it is |
+|------|------------|
+| [github.com/bitranox/linux-nested-vmbus-relay](https://github.com/bitranox/linux-nested-vmbus-relay) | A real fork of `kvm-x86/linux`, branch `nested-vmbus-relay`, a single commit on top of the latest `kvm-x86/next` (the mainline variant). |
+| [github.com/bitranox/pve-nested-vmbus-relay](https://github.com/bitranox/pve-nested-vmbus-relay) | The Proxmox VE kernel variant (Proxmox's kernel is not on GitHub, so this is a patch + build script + this design doc, not a fork). |
+
+The capability number `0x4f564d52` is an out-of-tree private sentinel; a real merge
+would take an assigned `KVM_CAP_*` value.
+
+**The request.** We would like help getting this into the upstream Linux kernel (and
+from there into the Proxmox kernel, which tracks Ubuntu/mainline). It is a small,
+self-contained, opt-in per-VM capability that touches only the nested-VMX reflect
+path and the Hyper-V hypercall path, and it is gated on the same enlightened-VMCS
+authorization KVM already trusts for the L2 TLB-flush hypercall. The natural reviewers
+are the KVM x86 and Hyper-V-on-KVM maintainers, and Microsoft's perspective on the
+nested-synic semantics would carry weight there. Concretely, we are asking for:
+
+1. A review of the relay's correctness against the nested-Hyper-V model, especially the
+   authorization gate and the open question in Part 4 (do we need the in-kernel
+   `HvPostMessage` read, or is the synchronous translation enough).
+2. Guidance on the right shape for upstream: the per-VM cap as written, or whether the
+   capability should be folded into the existing eVMCS / direct-hypercall machinery.
+3. If it is acceptable in principle, sponsorship or co-authorship on the LKML posting to
+   the KVM list, so it lands as a maintained feature rather than an out-of-tree patch we
+   carry for Proxmox.
+
+The goal is a stock, unmodified Windows guest running Hyper-V/VBS on KVM with no
+out-of-tree kernel carry, which benefits any KVM-based VMM, not just ours.

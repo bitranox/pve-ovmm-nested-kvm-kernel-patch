@@ -74,20 +74,21 @@ diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
 diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
 --- a/arch/x86/kvm/hyperv.c
 +++ b/arch/x86/kvm/hyperv.c
-@@ -2589,6 +2589,25 @@
+@@ -2589,6 +2589,26 @@
  		kvm_hv_hypercall_read_xmm(&hc);
  	}
  
 +	/*
 +	 * provmm nested-vmbus relay: a relayed L2 synic post (HvPostMessage /
-+	 * HvSignalEvent from a nested Hyper-V root) carries an L2 GPA in ingpa.
-+	 * Translate it to an L1 GPA, exactly like the L2 TLB-flush slow path in
-+	 * kvm_hv_flush_tlb(), so the in-kernel read and the userspace post path
-+	 * see the right page. The walk also filters pages removed from the L2
-+	 * root's GPA space: it returns INVALID_GPA, which we reject. Done
-+	 * synchronously in the faulting vCPU's exit context and never cached.
++	 * HvSignalEvent from a nested Hyper-V root) running on nested EPT carries
++	 * an L2 GPA in ingpa. Translate it to an L1 GPA like the L2 TLB-flush slow
++	 * path, gating on mmu_is_nested(): translate_nested_gpa() BUG_ON()s without
++	 * it, and with shadow paging the L2 GPA is already an L1 GPA so no
++	 * translation is needed. The walk also rejects pages removed from the L2
++	 * root's GPA space (INVALID_GPA). Done synchronously in the faulting
++	 * vCPU's exit context and never cached.
 +	 */
-+	if (!hc.fast && is_guest_mode(vcpu) &&
++	if (!hc.fast && mmu_is_nested(vcpu) &&
 +	    (hc.code == HVCALL_POST_MESSAGE || hc.code == HVCALL_SIGNAL_EVENT)) {
 +		hc.ingpa = kvm_x86_ops.nested_ops->translate_nested_gpa(
 +				vcpu, hc.ingpa, PFERR_GUEST_FINAL_MASK, NULL, 0);
