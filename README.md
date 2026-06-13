@@ -51,7 +51,9 @@ upstream UAPI assignment.
 `build/kvm_patch_apply_cap.sh` applies the change to a matching Proxmox kernel
 source tree (anchored text edits, so it survives point-release drift) and rebuilds
 only the KVM modules (`kvm.ko`, `kvm-intel.ko`). It does not touch anything else.
-Read the script header for how to obtain the matching source. Load with
+Read the script header for how to obtain the matching source, and
+`docs/kernel-source-pins.md` for the exact pve-kernel and Ubuntu-base commits per
+kernel version plus the fetch/prepare recipe. Load with
 `rmmod kvm_intel kvm && modprobe kvm_intel` (VMs stopped) or a reboot.
 
 `patch/kvm-nested-vmbus-relay-pve.patch` is the same change as a plain unified
