@@ -56,7 +56,7 @@ rm -rf "$SRC/debian" "$SRC/debian.master"
 build script at it:
 
 ```bash
-KVM_RELAY_SRC="$PWD/$SRC" ./build/kvm_patch_apply_cap.sh
+KVM_RELAY_SRC="$PWD/$SRC" ./build/kvm_patch_apply_hcall_relay.sh
 ```
 
 The build script copies `/boot/config-$(uname -r)` and the matching
