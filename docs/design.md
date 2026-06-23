@@ -63,7 +63,7 @@ functional as a hypervisor, we ran:
 The relay's per-L2 authorization gate correctly does not relay grandchild L2s;
 they keep their own L1 synic to `hvix64`.
 
-## The KVM capability: KVM_CAP_NESTED_HYPERV_HCALL_RELAY (249)
+## The KVM capability: KVM_CAP_NESTED_HYPERV_HCALL_RELAY (0x4f564d52)
 
 `KVM_CAP_NESTED_HYPERV_HCALL_RELAY` is a per-VM capability. `args[0]` is a
 bitmask selecting which nested Hyper-V hypercall classes to keep in L0:
@@ -77,7 +77,10 @@ The userspace VMM (OpenVMM) enables it via `KVM_ENABLE_CAP` on its kvm fd with
 `args[0] = 3` when the nested virt path is selected. The bitmask is validated
 against the supported bits; unknown bits return `-EINVAL`.
 
-The cap number 249 is the RFC placeholder pending upstream assignment.
+The PVE variant uses `0x4f564d52` ("OVMR"), a high private sentinel above
+upstream's cap range, so the out-of-tree cap never collides with a future
+upstream assignment; OpenVMM enables the identical value. The mainline RFC
+carries a low placeholder (249) that the upstream maintainers replace at merge.
 
 ## OpenVMM flags, and why each is needed
 

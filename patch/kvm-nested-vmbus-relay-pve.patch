@@ -1,8 +1,9 @@
-This file previously contained the old KVM_CAP_NESTED_VMBUS_RELAY patch
-(private sentinel 0x4f564d52). It has been superseded.
+This file previously contained the old KVM_CAP_NESTED_VMBUS_RELAY patch. It has
+been superseded.
 
-The current relay uses KVM_CAP_NESTED_HYPERV_HCALL_RELAY (cap 249, the upstream
-RFC number) with a bitmask args[0] selecting the relayable hypercall classes.
+The current relay uses KVM_CAP_NESTED_HYPERV_HCALL_RELAY, value 0x4f564d52 (the
+private sentinel OpenVMM enables; the mainline RFC proposes the low placeholder
+249), with a bitmask args[0] selecting the relayable hypercall classes.
 
 **Source of truth for the Proxmox VE kernel variant:**
   build/kvm_patch_apply_hcall_relay.sh

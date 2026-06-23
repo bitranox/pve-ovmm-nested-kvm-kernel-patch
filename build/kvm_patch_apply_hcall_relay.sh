@@ -11,7 +11,7 @@
 #
 # Six edits + one rename, matching the RFC patches:
 #   rename nested_evmcs_l2_tlb_flush_enabled -> nested_evmcs_l2_direct_hypercall_enabled
-#   include/uapi/linux/kvm.h          + KVM_CAP_NESTED_HYPERV_HCALL_RELAY 249
+#   include/uapi/linux/kvm.h          + KVM_CAP_NESTED_HYPERV_HCALL_RELAY 0x4f564d52
 #   arch/x86/include/uapi/asm/kvm.h   + the args[0] relay bits
 #   arch/x86/include/asm/kvm_host.h   + u64 nested_hv_relay_mask in struct kvm_arch
 #   arch/x86/kvm/x86.c                + KVM_ENABLE_CAP case validates+stores the mask
@@ -19,11 +19,20 @@
 #                                       hvgdk_mini include for them
 #   arch/x86/kvm/hyperv.c             + translate the relayed L2 synic post GPA
 #
-# Rebuilds kvm.ko + kvm-intel.ko. No guard, no Windows guest patch.
+# Rebuilds kvm.ko + kvm-intel.ko. No Windows guest patch.
+#
+# Optional timer-storm guard (GUARD=1, default off): on a host without VMX TSC
+# scaling the relay gets a nested Hyper-V guest booting, but the L1 root's
+# past-dated direct-mode one-shot synthetic timer can re-arm in a storm and hang
+# the guest. GUARD=1 applies patch/kernel-timer-guard-pve.patch after the relay
+# edits, bounding the re-arm with an adaptive forward dwell. The guard is gated on
+# !kvm_caps.has_tsc_control, so it is inert and costs nothing on a TSC-scaling
+# (modern) CPU. See docs/timer-guard.md.
 set -euo pipefail
 
 KREL="$(uname -r)"
 WORK="${KVM_RELAY_WORK:-/usr/src/kvm-nested-relay}"
+GUARD="${GUARD:-0}"
 JOBS="$(nproc)"
 
 [ "$(id -u)" = 0 ] || { echo "error: run as root" >&2; exit 1; }
@@ -62,7 +71,12 @@ def cap_def(t):
     if "KVM_CAP_NESTED_HYPERV_HCALL_RELAY" in t: return None
     anchor = "\n\nstruct kvm_irq_routing_irqchip {"
     if anchor not in t: raise SystemExit("kvm.h: kvm_irq_routing_irqchip anchor not found")
-    return t.replace(anchor, "\n#define KVM_CAP_NESTED_HYPERV_HCALL_RELAY 249" + anchor, 1)
+    # 0x4f564d52 ("OVMR"): a high private sentinel WELL above upstream's sequential
+    # KVM_CAP_* range, so this out-of-tree cap never collides with a future upstream
+    # cap (a low number like 249 clashes the moment upstream assigns it). The openvmm
+    # side (vm/kvm/src/lib.rs) MUST use the identical value. The upstream RFC keeps a
+    # low placeholder; the maintainers assign the real number at merge.
+    return t.replace(anchor, "\n#define KVM_CAP_NESTED_HYPERV_HCALL_RELAY 0x4f564d52" + anchor, 1)
 
 def bits_def(t):
     if "KVM_NESTED_HYPERV_RELAY_POST_MESSAGE" in t: return None
@@ -105,6 +119,22 @@ def nested_c_include(t):
     if anchor not in t: raise SystemExit("nested.c: hyperv.h include anchor not found")
     return t.replace(anchor, anchor + "\n#include <hyperv/hvgdk_mini.h>", 1)
 
+def nested_c_relay_param(t):
+    if "nested_hv_relay_enabled" in t: return None
+    anchor = '#include <hyperv/hvgdk_mini.h>'
+    if anchor not in t: raise SystemExit("nested.c: hvgdk_mini include anchor not found")
+    # Master on/off for the relay (debug/test, default on). Lives in nested.c so it
+    # registers under kvm_intel (the relay decision below is VMX-specific); set it to
+    # 0 to make every VM reflect the L2 root's posts to L1 (stock behaviour), e.g. to
+    # A/B the relay without building a relay-less kernel. The hyperv.c GPA-translation
+    # path is downstream of this gate, so disabling it here is sufficient.
+    ins = ("\n\n/* Master switch for the nested Hyper-V hypercall relay (default on). */\n"
+           "static bool nested_hv_relay_enabled = true;\n"
+           "module_param(nested_hv_relay_enabled, bool, 0644);\n"
+           "MODULE_PARM_DESC(nested_hv_relay_enabled,\n"
+           '\t"Relay nested Hyper-V root posts to L0 (default on; 0 = reflect to L1)");')
+    return t.replace(anchor, anchor + ins, 1)
+
 def nested_c(t):
     if "nested_hv_relay_mask" in t: return None
     anchor = "trace_kvm_nested_vmexit(vcpu, KVM_ISA_VMX);"
@@ -127,7 +157,7 @@ def nested_c(t):
 "\t * L0.  An L2 that L1 did not authorize (a grandchild of the root) is\n"
 "\t * never relayed and keeps its own L1 synic.\n"
 "\t */\n"
-"\tif (vcpu->kvm->arch.nested_hv_relay_mask &&\n"
+"\tif (nested_hv_relay_enabled && vcpu->kvm->arch.nested_hv_relay_mask &&\n"
 "\t    exit_reason.basic == EXIT_REASON_VMCALL &&\n"
 "\t    nested_evmcs_l2_direct_hypercall_enabled(vcpu)) {\n"
 "\t\tu64 mask = vcpu->kvm->arch.nested_hv_relay_mask;\n"
@@ -187,10 +217,27 @@ edit("arch/x86/include/uapi/asm/kvm.h", bits_def)
 edit("arch/x86/include/asm/kvm_host.h", kvm_host_h)
 edit("arch/x86/kvm/x86.c", x86_c)
 edit("arch/x86/kvm/vmx/nested.c", nested_c_include)
+edit("arch/x86/kvm/vmx/nested.c", nested_c_relay_param)
 edit("arch/x86/kvm/vmx/nested.c", nested_c)
 edit("arch/x86/kvm/hyperv.c", hyperv_c)
 print("edits done")
 PY
+
+# --- optional timer-storm guard (GUARD=1) ----------------------------------- #
+if [ "$GUARD" = 1 ]; then
+    GUARD_PATCH="$(dirname "$0")/../patch/kernel-timer-guard-pve.patch"
+    [ -f "$GUARD_PATCH" ] || { echo "error: guard patch not found: $GUARD_PATCH" >&2; exit 1; }
+    # Idempotent under set -e: apply if it applies cleanly, skip if already
+    # applied (reverse applies), error only on real source drift.
+    if patch -p1 -d "$SRC" -N --dry-run < "$GUARD_PATCH" >/dev/null 2>&1; then
+        patch -p1 -d "$SRC" -N < "$GUARD_PATCH"
+        echo "  applied timer-storm guard"
+    elif patch -R -p1 -d "$SRC" --dry-run < "$GUARD_PATCH" >/dev/null 2>&1; then
+        echo "  timer-storm guard already applied; skipping"
+    else
+        echo "error: timer-storm guard does not apply (kernel source drift?)" >&2; exit 1
+    fi
+fi
 
 # --- configure to the running kernel and build the KVM modules -------------- #
 cd "$SRC"

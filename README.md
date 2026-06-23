@@ -15,11 +15,14 @@ The root's vmbus never connects without this change. Its
 reflected up to `hvix64`, which has no path to forward it to the userspace VMM.
 The guest bugchecks `0x7B INACCESSIBLE_BOOT_DEVICE` early in boot.
 
-## The fix: KVM_CAP_NESTED_HYPERV_HCALL_RELAY (cap 249)
+## The fix: KVM_CAP_NESTED_HYPERV_HCALL_RELAY (cap 0x4f564d52)
 
-The patch adds a per-VM capability, `KVM_CAP_NESTED_HYPERV_HCALL_RELAY`
-(upstream RFC number 249), whose `args[0]` is a bitmask of hypercall classes to
-keep in L0. The userspace VMM enables it with
+The patch adds a per-VM capability, `KVM_CAP_NESTED_HYPERV_HCALL_RELAY`, with
+value `0x4f564d52` (a high private sentinel above upstream's cap range, so this
+out-of-tree cap never collides with a future upstream assignment; OpenVMM enables
+the identical value). The mainline RFC carries a low placeholder (249) that the
+upstream maintainers replace at merge. Its `args[0]` is a bitmask of hypercall
+classes to keep in L0. The userspace VMM enables it with
 `args[0] = KVM_NESTED_HYPERV_RELAY_POST_MESSAGE | KVM_NESTED_HYPERV_RELAY_SIGNAL_EVENT`.
 
 What changes in the kernel:
@@ -81,6 +84,10 @@ Key steps:
 KVM_RELAY_SRC=/path/to/linux-source \
     ./build/kvm_patch_apply_hcall_relay.sh
 
+# On a host without VMX TSC scaling, also apply the timer-storm guard:
+GUARD=1 KVM_RELAY_SRC=/path/to/linux-source \
+    ./build/kvm_patch_apply_hcall_relay.sh
+
 # Activate (stop all VMs first):
 rmmod kvm_intel kvm && modprobe kvm_intel
 ```
@@ -89,6 +96,34 @@ The script builds and installs both modules. Use `INSTALL=0` to build without
 installing. After loading, the userspace VMM (OpenVMM) enables the capability
 per-VM via `KVM_CAP_NESTED_HYPERV_HCALL_RELAY` with
 `args[0] = POST_MESSAGE | SIGNAL_EVENT` when nested virt is selected.
+
+## Timer-storm guard (non-TSC-scaling hosts)
+
+The relay gets a nested Hyper-V guest booting, but on a host without VMX TSC
+scaling that is not enough on its own. There the L1 root partition's direct-mode
+one-shot synthetic timer can re-arm in a storm (the deadline reads as past on the
+arming vCPU because the per-vCPU TSC phase is not exact), which pegs a host CPU
+and hangs the guest at a no-taskbar desktop. The guard bounds the re-arm in the
+kernel's `stimer_start()` with an adaptive forward dwell.
+
+The guard is gated on `!kvm_caps.has_tsc_control`, so it is inert and costs
+nothing on a TSC-scaling (modern) CPU. Two sysfs module parameters control it:
+
+- `hv_stimer_guard_enabled` (default on): the master switch.
+- `hv_stimer_imm_dwell_max_ns` (default 2000000, i.e. 2 ms): the cap the adaptive
+  dwell backs off to. This is the one performance lever. Lower it (around 250 us)
+  for an IO-bound nested guest (about +56% in-guest container disk IOPS); raise it
+  (around 8 ms) for a CPU-bound one (about +12% CPU); 2 ms is a balanced default.
+
+Build the modules with the guard by setting `GUARD=1`:
+
+```bash
+GUARD=1 KVM_RELAY_SRC=/path/to/linux-source ./build/kvm_patch_apply_hcall_relay.sh
+```
+
+That applies `patch/kernel-timer-guard-pve.patch` after the relay edits, then
+builds both modules. `docs/timer-guard.md` covers the root cause, the adaptive
+dwell, the TSC-scaling gate, and the measured IO-versus-CPU trade in full.
 
 ## Patch file
 

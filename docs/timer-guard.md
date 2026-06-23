@@ -1,0 +1,132 @@
+# Bounding past-dated one-shot Hyper-V timer re-arm storms
+
+Status: with the hypercall relay alone, a nested Hyper-V guest boots on a host
+without VMX TSC scaling, but it can hang at a no-taskbar desktop. The cause is a
+synthetic-timer re-arm storm in the L1 root partition. This guard bounds the
+storm in `stimer_start()` and is needed alongside the relay on such hosts; on a
+TSC-scaling host it is inert.
+
+## When the guard is needed
+
+The hypercall relay gets a Windows guest with Hyper-V/VBS enabled to boot under
+OpenVMM on KVM (see `design.md`). On a host whose CPU can scale the guest TSC
+(any modern CPU), that is all you need. On an older host without VMX TSC scaling,
+the boot reaches the desktop but then freezes: the desktop comes up with no
+taskbar and the guest stops responding, while one host CPU sits pegged at 100%.
+
+The freeze is a synthetic-timer re-arm storm, not a relay fault. The relay and
+the guard are independent: the relay makes the root vmbus connect; the guard
+keeps the root's timer use from pegging a CPU.
+
+## Root cause
+
+A Windows guest that enables Hyper-V/VBS runs its own kernel as the root
+partition of a nested hypervisor (an L2 guest):
+
+```
+guest kernel  ->  hvix64 (L1)  ->  KVM (L0)
+```
+
+The root partition uses a direct-mode auto-enable one-shot synthetic timer as a
+short spin-delay. It arms a deadline a few hundred microseconds out, takes the
+direct interrupt when it expires, and re-arms the same deadline.
+
+KVM's synthetic reference clock reads vCPU0's TSC for every vCPU
+(`get_time_ref_counter()`). On a host without VMX TSC scaling
+(`!kvm_caps.has_tsc_control`) the per-vCPU TSC phase cannot be made exact, so the
+arming vCPU can read its own legitimate near-future deadline as already in the
+past. Per TLFS v4 section 15.3.1, a past-dated one-shot expires immediately, so
+KVM marks it pending with zero delay. The guest takes the interrupt, EOIs, and
+the auto-enable re-arms the same past deadline. The timer then fires in a tight
+loop that pegs the vCPU in VM-exit handling, so the spin-wait never advances and
+the guest hangs. The reference-counter rate is exactly correct; only the per-vCPU
+phase is off, which is why the hang is intermittent.
+
+This is in-kernel KVM emulation. The synthetic timer fires entirely inside KVM
+(the SynIC timer code), with no userspace exit on the fire path, so a userspace
+VMM cannot see or rate-limit the storm. The firing decision is a kernel-only
+primitive, which is why the guard belongs in the kernel and not in OpenVMM.
+
+## The fix
+
+In `stimer_start()`, on the past-dated one-shot path and only when
+`!kvm_caps.has_tsc_control`, the guard detects the immediate-fire loop and arms a
+small forward dwell instead of firing with zero delay. Wall-clock and thus the
+reference counter advance during the dwell, so the deadline is genuinely reached
+and the loop breaks.
+
+The dwell is adaptive:
+
+- It starts at a small minimum and backs off toward a cap while the storm
+  persists, so a brief burst dwells little and a sustained storm dwells more.
+- It is sticky while a timer is throttled: a backoff dwell that grows past the
+  detect window does not reset the counter and drop the throttle, which would let
+  the storm burst back through between dwells.
+- It is released after a run of genuinely-future arms, with hysteresis: the
+  occasional future arm a guest interleaves into a storm (a timer reconfig, say)
+  does not drop the dwell and let the storm resume.
+
+An isolated past-dated one-shot still fires immediately. The TLFS-visible
+behaviour is unchanged for any non-storming use; only a sustained immediate-fire
+loop is slowed.
+
+## The TSC-scaling gate
+
+The guard is gated on `!kvm_caps.has_tsc_control`. On a TSC-scaling host that
+capability is set, the gate is false, the per-vCPU phase is exact, the loop never
+forms, and the guarded branch is never entered. So the guard has no effect and no
+cost on a modern CPU, whether or not it is enabled. It does anything only on the
+older hosts where the storm is possible.
+
+## Parameters
+
+Two sysfs-writable module parameters control the guard:
+
+| Parameter                    | Default            | What it does                                                          |
+|------------------------------|--------------------|----------------------------------------------------------------------|
+| `hv_stimer_guard_enabled`    | on                 | Master switch (bool). Inert on a TSC-scaling host regardless.        |
+| `hv_stimer_imm_dwell_max_ns` | 2000000 (2 ms)     | Caps how far the adaptive dwell backs off (nanoseconds).             |
+
+The detection thresholds, the initial dwell, the backoff factor, and the release
+hysteresis are fixed constants. Tuning across idle and nested-container load
+showed that only the cap changes useful behaviour, so the rest are not exposed.
+
+## The cap is the one performance lever
+
+`hv_stimer_imm_dwell_max_ns` trades host CPU spent on the storm against the
+latency of each skew-caught guest spin-wait. Measured in a nested Windows 11
+guest running an in-guest Windows container benchmark (7-Zip CPU, diskspd 4K
+random), sweeping the cap:
+
+- Default 2 ms: the storm settles to a low steady rate (down from about 1.3M
+  expirations/s), a balanced point that needs no per-host tuning.
+- Lower cap (about 250 us): each spin-wait finishes sooner, about +56% in-guest
+  container disk IOPS, at a higher storm rate (more host CPU).
+- Higher cap (about 8 ms): less host CPU, about +12% container CPU throughput, at
+  the cost of longer spin-waits (lower disk).
+
+So lower the cap for an IO-bound nested guest, raise it for a CPU-bound one, and
+leave it at the default for mixed or unknown work. The guest stayed responsive
+across the whole range. The storm rate measures host overhead, not guest
+throughput: the best-IO setting ran the higher storm.
+
+## Building with the guard
+
+The guard is opt-in in the build script:
+
+```bash
+GUARD=1 KVM_RELAY_SRC=/path/to/linux-source ./build/kvm_patch_apply_hcall_relay.sh
+```
+
+It applies `patch/kernel-timer-guard-pve.patch` after the relay edits, then
+builds `kvm.ko` + `kvm-intel.ko` as usual. Without `GUARD=1` the script builds
+the relay only. The patch edits `arch/x86/kvm/hyperv.c` (the guard logic and the
+two module params) and `arch/x86/include/asm/kvm_host.h` (the per-stimer guard
+state in `struct kvm_vcpu_hv_stimer`).
+
+## The mainline variant
+
+The mainline form of this guard is an RFC against the KVM list, with the
+corresponding patch on the `rfc-kernel-timer-guard` branch of:
+
+  https://github.com/bitranox/linux-nested-vmbus-relay
