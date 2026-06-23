@@ -110,6 +110,55 @@ leave it at the default for mixed or unknown work. The guest stayed responsive
 across the whole range. The storm rate measures host overhead, not guest
 throughput: the best-IO setting ran the higher storm.
 
+## Kernel guard versus the userland ovm-timer-guard
+
+OpenVMM also ships a userland alternative, the per-VM `--ovm-timer-guard`. It
+drops the Hyper-V reference TSC page so KVM serves time from kvmclock; the storm
+then never forms, with no kernel patch at all, at the cost of trapped Hyper-V time
+reads. The two mitigations were compared in a nested Windows 11 guest running an
+in-guest Windows container benchmark (7-Zip CPU, diskspd 4K random) on a host
+without VMX TSC scaling.
+
+At a single moderate load point:
+
+| Config                        | storm/s | 7-Zip MIPS | disk MiB/s | disk IOPS | usable                  |
+|-------------------------------|--------:|-----------:|-----------:|----------:|-------------------------|
+| process isolation, no Hyper-V |     ~0  |      3491  |       399  |     102k  | baseline (no nested VM) |
+| Hyper-V iso + kernel guard    |     ~8k |      3015  |      53.0  |     13.6k | yes                     |
+| Hyper-V iso + no mitigation   |   ~2.5M |        -   |        -   |       -   | no (storm, unreachable) |
+| Hyper-V iso + ovm-timer-guard |     ~0  |      2900  |      46.6  |     11.9k | yes                     |
+
+Disk throughput depends on queue depth. Swept over concurrency (same 4K-random
+base):
+
+| Disk load | kernel-guard MiB/s | kernel-guard IOPS | ovm-guard MiB/s | ovm-guard IOPS |
+|-----------|-------------------:|------------------:|----------------:|---------------:|
+| -o4  -t2  |              53.0  |            13566  |           46.6  |          11930 |
+| -o16 -t2  |              43.7  |            11187  |           48.3  |          12364 |
+| -o32 -t4  |              27.8  |             7122  |           38.5  |           9857 |
+
+CPU throughput is within a few percent either way (the guard's residual storm
+against the ovm-guard's trapped time reads). Disk is the differentiator: under
+rising concurrency the kernel guard's residual storm competes for CPU and its
+throughput drops, while the storm-free ovm-timer-guard holds. The two cross over
+around -o16, and at heavy load the ovm-timer-guard is about +38%.
+
+### Which to use
+
+The typical nested workload here is Hyper-V-isolated Windows containers (CI build
+agents and self-hosted runners) and nested dev/test guests, which are CPU-heavy
+while compiling and disk-heavy while checking out and restoring, so the load is
+mixed and bursty rather than steadily one or the other.
+
+- Default to the kernel guard at the 2 ms cap. It is host-global, self-tuning, and
+  needs no per-VM setup, and it serves interactive, mixed, and CPU-bound nested
+  guests well. This is the right baseline for most hosts.
+- For a host that mostly runs disk-heavy nested work, either lower the cap (which
+  recovers IOPS host-wide at the price of more host CPU) or put the heaviest-IO
+  VMs on the per-VM `--ovm-timer-guard` for the best disk scaling with no residual
+  storm.
+- If the kernel cannot be patched, the ovm-timer-guard is the per-VM fallback.
+
 ## Building with the guard
 
 The guard is opt-in in the build script:

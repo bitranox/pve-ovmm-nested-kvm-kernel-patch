@@ -19,9 +19,8 @@ The guest bugchecks `0x7B INACCESSIBLE_BOOT_DEVICE` early in boot.
 
 The patch adds a per-VM capability, `KVM_CAP_NESTED_HYPERV_HCALL_RELAY`, with
 value `0x4f564d52` (a high private sentinel above upstream's cap range, so this
-out-of-tree cap never collides with a future upstream assignment; OpenVMM enables
-the identical value). The mainline RFC carries a low placeholder (249) that the
-upstream maintainers replace at merge. Its `args[0]` is a bitmask of hypercall
+out-of-tree cap never collides with a future upstream assignment; OpenVMM and
+the mainline fork enable the identical value). Its `args[0]` is a bitmask of hypercall
 classes to keep in L0. The userspace VMM enables it with
 `args[0] = KVM_NESTED_HYPERV_RELAY_POST_MESSAGE | KVM_NESTED_HYPERV_RELAY_SIGNAL_EVENT`.
 
@@ -65,7 +64,7 @@ text insertions) rather than as a fork.
 The **mainline** variant is an RFC posted to the KVM list; the corresponding
 patch-repo fork against `kvm-x86/linux` is at:
 
-  https://github.com/bitranox/linux-nested-vmbus-relay (branch `nested-vmbus-relay`)
+  https://github.com/bitranox/linux-nested-vmbus-relay (branch `rfc-nested-hyperv-hcall-relay`)
 
 ## Building for a Proxmox VE kernel
 
@@ -121,20 +120,20 @@ Build the modules with the guard by setting `GUARD=1`:
 GUARD=1 KVM_RELAY_SRC=/path/to/linux-source ./build/kvm_patch_apply_hcall_relay.sh
 ```
 
-That applies `patch/kernel-timer-guard-pve.patch` after the relay edits, then
+That applies `patch/pve/kernel-timer-guard-pve.patch` after the relay edits, then
 builds both modules. `docs/timer-guard.md` covers the root cause, the adaptive
 dwell, the TSC-scaling gate, and the measured IO-versus-CPU trade in full.
 
 ## Patch files
 
-`patch/kvm-nested-vmbus-relay-pve.patch` (the relay) and
-`patch/kernel-timer-guard-pve.patch` (the timer-storm guard) are the current
+`patch/pve/kvm-nested-vmbus-relay-pve.patch` (the relay) and
+`patch/pve/kernel-timer-guard-pve.patch` (the timer-storm guard) are the current
 PVE-form diffs (cap `0x4f564d52`), provided as point-in-time snapshots. The build
 script (`build/kvm_patch_apply_hcall_relay.sh`) remains the source of truth for
 what gets applied: it inserts the relay by anchored text edits that track
 point-release drift where a static patch would not, and applies the guard patch
-when `GUARD=1`. The mainline-form patches (the upstream RFC, cap 249) are at
-`github.com/bitranox/linux-nested-vmbus-relay` on branch `nested-vmbus-relay`.
+when `GUARD=1`. The mainline-form patches (the upstream RFC, same cap 0x4f564d52) are at
+`github.com/bitranox/linux-nested-vmbus-relay` on branch `rfc-nested-hyperv-hcall-relay`.
 
 ## Design
 

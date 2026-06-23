@@ -1,0 +1,210 @@
+From 4c351bfb57ad1a0915150b72d7e0ca28583f173a Mon Sep 17 00:00:00 2001
+From: bitranox <rnowotny1966@gmail.com>
+Date: Wed, 17 Jun 2026 17:01:08 +0200
+Subject: [PATCH] KVM: x86: Bound past-dated one-shot Hyper-V timer re-arm
+ storms
+
+When a one-shot synthetic timer's deadline is already in the past and
+the host cannot scale the guest TSC (!kvm_caps.has_tsc_control), bound
+the immediate-fire rate in stimer_start(): once an immediate-fire loop
+is detected, arm the hrtimer for an adaptive forward dwell instead of
+firing with zero delay, until the timer arms a genuinely-future deadline
+again.
+
+A Hyper-V guest can use a direct-mode auto-enable one-shot synthetic
+timer as a short spin-delay: arm a deadline a few hundred microseconds
+out, take the direct interrupt, and re-arm the same deadline. On a host
+without VMX TSC scaling the synthetic reference clock's per-vCPU phase
+cannot be made exact (get_time_ref_counter() reads vCPU0's TSC), so the
+arming vCPU can read its own legitimate near-future deadline as already
+past. Per TLFS v4 15.3.1 a past-dated one-shot expires immediately, so
+KVM marks it pending with zero delay; the guest EOIs and the auto-enable
+re-arms the same past deadline, and the timer fires in a tight loop
+(~96k re-arms/s/vCPU) that pegs the vCPU so the spin-wait never
+advances. Seen as an intermittent hang during a nested Hyper-V boot.
+
+Detect the loop (more than HV_STIMER_IMM_MAX immediate fires within
+HV_STIMER_IMM_WINDOW_NS) and arm a forward dwell that backs off from
+HV_STIMER_IMM_DWELL_MIN_NS toward the hv_stimer_imm_dwell_max_ns cap
+while the storm persists, released only after HV_STIMER_IMM_RESET_ARMS
+consecutive genuinely-future arms so the occasional future arm a guest
+interleaves into a storm does not drop the throttle. An isolated
+past-dated one-shot still fires immediately.
+
+The guard is gated on !kvm_caps.has_tsc_control, so on a TSC-scaling
+host (any modern CPU) the branch is never entered and the guard costs
+nothing. Two sysfs-writable module parameters: hv_stimer_guard_enabled
+(default on, inert on TSC-scaling CPUs) and hv_stimer_imm_dwell_max_ns
+(the backoff cap, default 2 ms), which trades host CPU against guest
+spin-wait latency; the detection thresholds are fixed constants.
+
+Measured on a no-VMX-TSC-scaling host running nested Windows 11: ~1.3M
+expirations/s unguarded (the guest hangs) versus ~9.4k/s at the default
+2 ms cap (the guest boots to a live desktop), holding under nested L2
+container load.
+
+Assisted-by: Claude:claude-opus-4-8
+Signed-off-by: bitranox <rnowotny1966@gmail.com>
+---
+ arch/x86/include/asm/kvm_host.h |  10 +++
+ arch/x86/kvm/hyperv.c           | 110 ++++++++++++++++++++++++++++++++
+ 2 files changed, 120 insertions(+)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 3886b536c8a5..4530fc143f6d 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -676,6 +676,16 @@ struct kvm_vcpu_hv_stimer {
+ 	u64 exp_time;
+ 	struct hv_message msg;
+ 	bool msg_pending;
++	/*
++	 * Past-dated one-shot re-arm storm guard (hosts without TSC scaling):
++	 * imm_fire_ns/imm_fire_count detect the immediate-fire loop, imm_dwell_ns
++	 * is the current adaptive-backoff dwell, imm_future_count counts
++	 * consecutive genuinely-future arms for the throttle-release hysteresis.
++	 */
++	u64 imm_fire_ns;
++	u32 imm_fire_count;
++	u64 imm_dwell_ns;
++	u32 imm_future_count;
+ };
+ 
+ /* Hyper-V synthetic interrupt controller (SynIC)*/
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index fd4eb1e561f7..0dbc2af86ae2 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -44,6 +44,40 @@
+ 
+ #define KVM_HV_MAX_SPARSE_VCPU_SET_BITS DIV_ROUND_UP(KVM_MAX_VCPUS, HV_VCPUS_PER_SPARSE_BANK)
+ 
++/*
++ * Past-dated one-shot Hyper-V synthetic-timer re-arm storm guard, see
++ * stimer_start(). It engages ONLY on hosts that cannot scale the guest TSC
++ * (!kvm_caps.has_tsc_control), where the storm is possible. On a TSC-scaling
++ * host (any modern CPU) the guarded branch is never entered, so the guard has
++ * no effect and no cost there regardless of hv_stimer_guard_enabled. Two
++ * sysfs-writable controls:
++ */
++static bool hv_stimer_guard_enabled = true;
++module_param(hv_stimer_guard_enabled, bool, 0644);
++MODULE_PARM_DESC(hv_stimer_guard_enabled,
++	"Bound past-dated Hyper-V one-shot stimer re-arm storms on non-TSC-scaling hosts (default on; inert on TSC-scaling CPUs)");
++
++static unsigned int hv_stimer_imm_dwell_max_ns = 2000000;
++module_param(hv_stimer_imm_dwell_max_ns, uint, 0644);
++MODULE_PARM_DESC(hv_stimer_imm_dwell_max_ns,
++	"Cap (ns) the adaptive re-arm dwell backs off to. Higher = less host CPU on the storm but longer guest spin-waits (favours CPU-bound nested work); lower = the reverse (favours IO-bound nested work). Default 2000000 (2 ms)");
++
++/*
++ * Fixed parameters of the adaptive dwell. Tuning across idle and nested
++ * container load showed that only the cap above changes useful behaviour, so
++ * the rest are constants: more than HV_STIMER_IMM_MAX immediate fires within
++ * HV_STIMER_IMM_WINDOW_NS arm the guard; the dwell starts at
++ * HV_STIMER_IMM_DWELL_MIN_NS and grows by HV_STIMER_IMM_BACKOFF each in-window
++ * step up to the cap; it is released after HV_STIMER_IMM_RESET_ARMS consecutive
++ * genuinely-future arms (hysteresis, so the brief future arms a storm
++ * interleaves do not drop the throttle and let it burst back through).
++ */
++#define HV_STIMER_IMM_MAX		16
++#define HV_STIMER_IMM_WINDOW_NS		100000
++#define HV_STIMER_IMM_DWELL_MIN_NS	50000
++#define HV_STIMER_IMM_BACKOFF		2
++#define HV_STIMER_IMM_RESET_ARMS	8
++
+ /*
+  * As per Hyper-V TLFS, extended hypercalls start from 0x8001
+  * (HvExtCallQueryCapabilities). Response of this hypercalls is a 64 bit value
+@@ -670,10 +704,86 @@ static int stimer_start(struct kvm_vcpu_hv_stimer *stimer)
+ 		 * specification v4(15.3.1):
+ 		 * "If a one shot is enabled and the specified count is in
+ 		 * the past, it will expire immediately."
++		 *
++		 * Guard against a past-dated one-shot re-arm storm on hosts that
++		 * cannot scale the guest TSC (!kvm_caps.has_tsc_control). There
++		 * the synthetic reference clock's per-vCPU phase cannot be made
++		 * exact (get_time_ref_counter() reads vCPU0's TSC), so a guest's
++		 * legitimate near-future direct one-shot deadline can read as
++		 * already-past on the arming vCPU. Firing with zero delay then
++		 * lets an auto-enable re-arm of the same deadline busy-loop
++		 * forever. When such a loop is detected (more than
++		 * HV_STIMER_IMM_MAX immediate fires within HV_STIMER_IMM_WINDOW_NS
++		 * of each other), arm a forward dwell instead so wall-clock
++		 * advances and the deadline is genuinely reached. The dwell backs
++		 * off from HV_STIMER_IMM_DWELL_MIN_NS toward the
++		 * hv_stimer_imm_dwell_max_ns cap (a brief burst dwells little, a
++		 * sustained storm dwells more). The state resets on a genuinely-
++		 * future arm, so an isolated past-dated one-shot still fires
++		 * immediately. On a TSC-scaling host has_tsc_control is set, the
++		 * gate below is false, the phase is exact, and this path is dead,
++		 * so the guard costs nothing on modern CPUs.
+ 		 */
++		if (!kvm_caps.has_tsc_control && hv_stimer_guard_enabled) {
++			u64 now_ns = ktime_to_ns(ktime_now);
++
++			/* a past-dated arm breaks any future-arm streak */
++			stimer->imm_future_count = 0;
++
++			/*
++			 * imm_dwell_ns != 0 means this timer is already being
++			 * throttled.  Stay sticky and keep dwelling until a
++			 * genuinely-future arm clears it below; otherwise a backoff
++			 * dwell that grows past the detect window would reset the
++			 * counter, drop the throttle, and let the storm burst
++			 * through between dwells.
++			 */
++			if (!stimer->imm_dwell_ns) {
++				if (stimer->imm_fire_ns &&
++				    now_ns - stimer->imm_fire_ns < HV_STIMER_IMM_WINDOW_NS)
++					stimer->imm_fire_count++;
++				else
++					stimer->imm_fire_count = 0;
++				stimer->imm_fire_ns = now_ns;
++			}
++
++			if (stimer->imm_dwell_ns ||
++			    stimer->imm_fire_count > HV_STIMER_IMM_MAX) {
++				if (!stimer->imm_dwell_ns) {
++					/* enter at the minimum dwell */
++					stimer->imm_dwell_ns = HV_STIMER_IMM_DWELL_MIN_NS;
++				} else if (stimer->imm_dwell_ns < hv_stimer_imm_dwell_max_ns) {
++					/* back off toward the cap */
++					stimer->imm_dwell_ns *= HV_STIMER_IMM_BACKOFF;
++					if (stimer->imm_dwell_ns > hv_stimer_imm_dwell_max_ns)
++						stimer->imm_dwell_ns =
++							hv_stimer_imm_dwell_max_ns;
++				}
++
++				hrtimer_start(&stimer->timer,
++					      ktime_add_ns(ktime_now,
++							   stimer->imm_dwell_ns),
++					      HRTIMER_MODE_ABS);
++				return 0;
++			}
++		}
+ 		stimer_mark_pending(stimer, false);
+ 		return 0;
+ 	}
++	if (!kvm_caps.has_tsc_control && hv_stimer_guard_enabled) {
++		/*
++		 * Genuinely-future arm: the storm may be over. Require
++		 * HV_STIMER_IMM_RESET_ARMS consecutive future arms before clearing
++		 * the throttle, so the occasional future arm a guest interleaves
++		 * into a storm (e.g. a timer reconfig) does not drop the dwell and
++		 * let the storm burst back through.
++		 */
++		if (++stimer->imm_future_count >= HV_STIMER_IMM_RESET_ARMS) {
++			stimer->imm_fire_count = 0;
++			stimer->imm_dwell_ns = 0;
++			stimer->imm_future_count = 0;
++		}
++	}
+ 
+ 	trace_kvm_hv_stimer_start_one_shot(hv_stimer_to_vcpu(stimer)->vcpu_id,
+ 					   stimer->index,
+
+base-commit: c1f7303302927f9cbf4efedf70f0512cde168c65
+-- 
+2.53.0
+

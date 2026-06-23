@@ -79,8 +79,8 @@ against the supported bits; unknown bits return `-EINVAL`.
 
 The PVE variant uses `0x4f564d52` ("OVMR"), a high private sentinel above
 upstream's cap range, so the out-of-tree cap never collides with a future
-upstream assignment; OpenVMM enables the identical value. The mainline RFC
-carries a low placeholder (249) that the upstream maintainers replace at merge.
+upstream assignment; OpenVMM and the mainline fork enable the identical value.
+The upstream maintainers may reassign the number if the cap is merged.
 
 ## OpenVMM flags, and why each is needed
 
@@ -137,6 +137,20 @@ All live in the `nested_virt` block of
   aborting any guest-initiated reset.
 - `KVM_CAP_NESTED_HYPERV_HCALL_RELAY` per-VM: opts the VM into the relay with
   the selected bitmask.
+
+### The nested enlightenment preset, and enforce_cpuid off
+
+The `nested_virt` path advertises the enlightenments above as a fixed set
+(`windows_nested`): eVMCS (see `use_vmcs_enlightenments` and
+`KVM_CAP_HYPERV_ENLIGHTENED_VMCS` above), plus reenlightenment and stimer_direct,
+on unconditionally. eVMCS is not optional here: a storvsc-nested boot disk needs
+the enlightened VMCS to reconnect after the L1->L2 handover.
+
+`KVM_CAP_HYPERV_ENFORCE_CPUID` stays off. With it on, KVM denies any Hyper-V MSR
+or hypercall `hvix64` uses that the partition's CPUID does not advertise, so
+`hvix64` stalls before its first nested VM entry (`kvm_nested_vmenter` stays 0)
+and the guest hangs at the boot spinner. It is dropped from the nested preset;
+QEMU's `hv-enforce-cpuid` defaults off and PVE never sets it.
 
 ## KVM functions involved
 
@@ -227,5 +241,5 @@ operation; the faulting vCPU cannot flush mid-hypercall.
 
 | Repo | What it is |
 |------|-----------|
-| [github.com/bitranox/linux-nested-vmbus-relay](https://github.com/bitranox/linux-nested-vmbus-relay) | Fork of `kvm-x86/linux`, branch `nested-vmbus-relay`: the mainline RFC form as a single commit on top of `kvm-x86/next`. |
+| [github.com/bitranox/linux-nested-vmbus-relay](https://github.com/bitranox/linux-nested-vmbus-relay) | Fork of `kvm-x86/linux`, branch `rfc-nested-hyperv-hcall-relay`: the mainline RFC form as a single commit on top of `kvm-x86/next`. |
 | [github.com/bitranox/pve-ovmm-nested-kvm-kernel-patch](https://github.com/bitranox/pve-ovmm-nested-kvm-kernel-patch) | Proxmox VE kernel variant: a build script (anchored text insertions) plus this design doc, not a fork. |

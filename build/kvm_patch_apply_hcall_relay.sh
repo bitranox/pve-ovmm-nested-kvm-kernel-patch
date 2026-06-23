@@ -24,7 +24,7 @@
 # Optional timer-storm guard (GUARD=1, default off): on a host without VMX TSC
 # scaling the relay gets a nested Hyper-V guest booting, but the L1 root's
 # past-dated direct-mode one-shot synthetic timer can re-arm in a storm and hang
-# the guest. GUARD=1 applies patch/kernel-timer-guard-pve.patch after the relay
+# the guest. GUARD=1 applies patch/pve/kernel-timer-guard-pve.patch after the relay
 # edits, bounding the re-arm with an adaptive forward dwell. The guard is gated on
 # !kvm_caps.has_tsc_control, so it is inert and costs nothing on a TSC-scaling
 # (modern) CPU. See docs/timer-guard.md.
@@ -225,7 +225,7 @@ PY
 
 # --- optional timer-storm guard (GUARD=1) ----------------------------------- #
 if [ "$GUARD" = 1 ]; then
-    GUARD_PATCH="$(dirname "$0")/../patch/kernel-timer-guard-pve.patch"
+    GUARD_PATCH="$(dirname "$0")/../patch/pve/kernel-timer-guard-pve.patch"
     [ -f "$GUARD_PATCH" ] || { echo "error: guard patch not found: $GUARD_PATCH" >&2; exit 1; }
     # Idempotent under set -e: apply if it applies cleanly, skip if already
     # applied (reverse applies), error only on real source drift.
