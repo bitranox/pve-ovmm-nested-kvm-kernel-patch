@@ -1,15 +1,192 @@
-This file previously contained the old KVM_CAP_NESTED_VMBUS_RELAY patch. It has
-been superseded.
-
-The current relay uses KVM_CAP_NESTED_HYPERV_HCALL_RELAY, value 0x4f564d52 (the
-private sentinel OpenVMM enables; the mainline RFC proposes the low placeholder
-249), with a bitmask args[0] selecting the relayable hypercall classes.
-
-**Source of truth for the Proxmox VE kernel variant:**
-  build/kvm_patch_apply_hcall_relay.sh
-  (anchored text insertions; apply to a kernel source tree matching `uname -r`)
-
-**Upstream RFC form (mainline kernel):**
-  github.com/bitranox/linux-nested-vmbus-relay, branch nested-vmbus-relay
-  Two patches: (1) rename nested_evmcs_l2_tlb_flush_enabled to
-  nested_evmcs_l2_direct_hypercall_enabled, (2) add the relay.
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 99f37fc13..a384585f4 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1412,6 +1412,8 @@ enum kvm_mmu_type {
+ };
+ 
+ struct kvm_arch {
++	/* Relayable nested Hyper-V hypercalls (KVM_CAP_NESTED_HYPERV_HCALL_RELAY args[0] bitmask). */
++	u64 nested_hv_relay_mask;
+ 	unsigned long n_used_mmu_pages;
+ 	unsigned long n_requested_mmu_pages;
+ 	unsigned long n_max_mmu_pages;
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index 5f2b30d04..494c7fbe2 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -965,6 +965,10 @@ struct kvm_hyperv_eventfd {
+ /* x86-specific KVM_EXIT_HYPERCALL flags. */
+ #define KVM_EXIT_HYPERCALL_LONG_MODE	_BITULL(0)
+ 
++/* Relayable nested Hyper-V hypercalls for KVM_CAP_NESTED_HYPERV_HCALL_RELAY. */
++#define KVM_NESTED_HYPERV_RELAY_POST_MESSAGE	_BITULL(0)
++#define KVM_NESTED_HYPERV_RELAY_SIGNAL_EVENT	_BITULL(1)
++
+ #define KVM_X86_DEFAULT_VM	0
+ #define KVM_X86_SW_PROTECTED_VM	1
+ #define KVM_X86_SEV_VM		2
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index f35fae3a7..36d267b9e 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -2589,6 +2589,24 @@ int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
+ 		kvm_hv_hypercall_read_xmm(&hc);
+ 	}
+ 
++	/*
++	 * A relayed nested-Hyper-V root's HvPostMessage / HvSignalEvent (see
++	 * nested_vmx_reflect_vmexit()) runs on nested EPT and carries an L2 GPA
++	 * in ingpa.  Translate it to an L1 GPA, mirroring the L2 TLB-flush slow
++	 * path and gating on mmu_is_nested(): translate_nested_gpa() requires an
++	 * active nested MMU, and with shadow paging the L2 GPA is already an L1
++	 * GPA.  The walk rejects pages removed from the L2 root's GPA space.
++	 */
++	if (vcpu->kvm->arch.nested_hv_relay_mask && !hc.fast && mmu_is_nested(vcpu) &&
++	    (hc.code == HVCALL_POST_MESSAGE || hc.code == HVCALL_SIGNAL_EVENT)) {
++		hc.ingpa = kvm_x86_ops.nested_ops->translate_nested_gpa(
++				vcpu, hc.ingpa, PFERR_GUEST_FINAL_MASK, NULL, 0);
++		if (unlikely(hc.ingpa == INVALID_GPA)) {
++			ret = HV_STATUS_INVALID_HYPERCALL_INPUT;
++			goto hypercall_complete;
++		}
++	}
++
+ 	switch (hc.code) {
+ 	case HVCALL_NOTIFY_LONG_SPIN_WAIT:
+ 		if (unlikely(hc.rep || hc.var_cnt)) {
+diff --git a/arch/x86/kvm/vmx/hyperv.c b/arch/x86/kvm/vmx/hyperv.c
+index fa41d036a..7d0f78d9a 100644
+--- a/arch/x86/kvm/vmx/hyperv.c
++++ b/arch/x86/kvm/vmx/hyperv.c
+@@ -209,7 +209,7 @@ int nested_enable_evmcs(struct kvm_vcpu *vcpu,
+ 	return 0;
+ }
+ 
+-bool nested_evmcs_l2_tlb_flush_enabled(struct kvm_vcpu *vcpu)
++bool nested_evmcs_l2_direct_hypercall_enabled(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_vcpu_hv *hv_vcpu = to_hv_vcpu(vcpu);
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+diff --git a/arch/x86/kvm/vmx/hyperv.h b/arch/x86/kvm/vmx/hyperv.h
+index 11a339009..87210011c 100644
+--- a/arch/x86/kvm/vmx/hyperv.h
++++ b/arch/x86/kvm/vmx/hyperv.h
+@@ -58,7 +58,7 @@ int nested_enable_evmcs(struct kvm_vcpu *vcpu,
+ 			uint16_t *vmcs_version);
+ void nested_evmcs_filter_control_msr(struct kvm_vcpu *vcpu, u32 msr_index, u64 *pdata);
+ int nested_evmcs_check_controls(struct vmcs12 *vmcs12);
+-bool nested_evmcs_l2_tlb_flush_enabled(struct kvm_vcpu *vcpu);
++bool nested_evmcs_l2_direct_hypercall_enabled(struct kvm_vcpu *vcpu);
+ void vmx_hv_inject_synthetic_vmexit_post_tlb_flush(struct kvm_vcpu *vcpu);
+ #else
+ static inline bool evmptr_is_valid(u64 evmptr)
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 564165262..555f6fc58 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -11,6 +11,13 @@
+ #include "x86.h"
+ #include "cpuid.h"
+ #include "hyperv.h"
++#include <hyperv/hvgdk_mini.h>
++
++/* Master switch for the nested Hyper-V hypercall relay (default on). */
++static bool nested_hv_relay_enabled = true;
++module_param(nested_hv_relay_enabled, bool, 0644);
++MODULE_PARM_DESC(nested_hv_relay_enabled,
++	"Relay nested Hyper-V root posts to L0 (default on; 0 = reflect to L1)");
+ #include "mmu.h"
+ #include "nested.h"
+ #include "pmu.h"
+@@ -3523,7 +3530,7 @@ static bool vmx_get_nested_state_pages(struct kvm_vcpu *vcpu)
+ 	/*
+ 	 * Note: nested_get_evmcs_page() also updates 'vp_assist_page' copy
+ 	 * in 'struct kvm_vcpu_hv' in case eVMCS is in use, this is mandatory
+-	 * to make nested_evmcs_l2_tlb_flush_enabled() work correctly post
++	 * to make nested_evmcs_l2_direct_hypercall_enabled() work correctly post
+ 	 * migration.
+ 	 */
+ 	if (!nested_get_evmcs_page(vcpu)) {
+@@ -6532,7 +6539,7 @@ static bool nested_vmx_l0_wants_exit(struct kvm_vcpu *vcpu,
+ 	case EXIT_REASON_VMCALL:
+ 		/* Hyper-V L2 TLB flush hypercall is handled by L0 */
+ 		return guest_hv_cpuid_has_l2_tlb_flush(vcpu) &&
+-			nested_evmcs_l2_tlb_flush_enabled(vcpu) &&
++			nested_evmcs_l2_direct_hypercall_enabled(vcpu) &&
+ 			kvm_hv_is_tlb_flush_hcall(vcpu);
+ #endif
+ 	default:
+@@ -6709,6 +6716,41 @@ bool nested_vmx_reflect_vmexit(struct kvm_vcpu *vcpu)
+ 
+ 	trace_kvm_nested_vmexit(vcpu, KVM_ISA_VMX);
+ 
++	/*
++	 * Relay a nested Hyper-V root partition's enlightened synic posts to L0
++	 * rather than reflecting them to L1.  A Windows guest that enables
++	 * Hyper-V/VBS runs its kernel as the root partition of a nested
++	 * hypervisor (an L2 guest), whose HvPostMessage/HvSignalEvent VMCALLs
++	 * would otherwise be reflected to L1, which has no path to forward them
++	 * to the userspace VMM.  When userspace selected the call class via
++	 * KVM_CAP_NESTED_HYPERV_HCALL_RELAY and L1 authorized this L2 for direct
++	 * nested hypercalls (the same eVMCS gate honored for the L2 TLB-flush
++	 * hypercall), handle the post in L0: clear the nested bit so the standard
++	 * hypercall path accepts the call, and return false to keep the exit in
++	 * L0.  An L2 that L1 did not authorize (a grandchild of the root) is
++	 * never relayed and keeps its own L1 synic.
++	 */
++	if (nested_hv_relay_enabled && vcpu->kvm->arch.nested_hv_relay_mask &&
++	    exit_reason.basic == EXIT_REASON_VMCALL &&
++	    nested_evmcs_l2_direct_hypercall_enabled(vcpu)) {
++		u64 mask = vcpu->kvm->arch.nested_hv_relay_mask;
++		u64 input = kvm_rcx_read(vcpu);
++		u16 code = input & 0xffff;
++		bool relay = false;
++
++		if (input & HV_HYPERCALL_NESTED) {
++			if (code == HVCALL_POST_MESSAGE)
++				relay = mask & KVM_NESTED_HYPERV_RELAY_POST_MESSAGE;
++			else if (code == HVCALL_SIGNAL_EVENT)
++				relay = mask & KVM_NESTED_HYPERV_RELAY_SIGNAL_EVENT;
++		}
++
++		if (relay) {
++			kvm_rcx_write(vcpu, input & ~HV_HYPERCALL_NESTED);
++			return false;
++		}
++	}
++
+ 	/* If L0 (KVM) wants the exit, it trumps L1's desires. */
+ 	if (nested_vmx_l0_wants_exit(vcpu, exit_reason))
+ 		return false;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 499b3f4ae..0b748a8e6 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6743,6 +6743,14 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		return -EINVAL;
+ 
+ 	switch (cap->cap) {
++	case KVM_CAP_NESTED_HYPERV_HCALL_RELAY:
++		r = -EINVAL;
++		if (cap->args[0] & ~(KVM_NESTED_HYPERV_RELAY_POST_MESSAGE |
++				     KVM_NESTED_HYPERV_RELAY_SIGNAL_EVENT))
++			break;
++		kvm->arch.nested_hv_relay_mask = cap->args[0];
++		r = 0;
++		break;
+ 	case KVM_CAP_DISABLE_QUIRKS2:
+ 		r = -EINVAL;
+ 		if (cap->args[0] & ~kvm_caps.supported_quirks)
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 3f0d8d3c3..f66e6495d 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -990,6 +990,7 @@ struct kvm_enable_cap {
+ #define KVM_CAP_ARM_SEA_TO_USER 245
+ #define KVM_CAP_S390_USER_OPEREXEC 246
+ #define KVM_CAP_S390_KEYOP 247
++#define KVM_CAP_NESTED_HYPERV_HCALL_RELAY 0x4f564d52
+ 
+ struct kvm_irq_routing_irqchip {
+ 	__u32 irqchip;

@@ -125,12 +125,15 @@ That applies `patch/kernel-timer-guard-pve.patch` after the relay edits, then
 builds both modules. `docs/timer-guard.md` covers the root cause, the adaptive
 dwell, the TSC-scaling gate, and the measured IO-versus-CPU trade in full.
 
-## Patch file
+## Patch files
 
-`patch/kvm-nested-vmbus-relay-pve.patch` has been superseded by the build
-script (`build/kvm_patch_apply_hcall_relay.sh`), which tracks point-release
-drift automatically. The script is the source of truth for what gets applied.
-The upstream RFC patches (the mainline form) are at
+`patch/kvm-nested-vmbus-relay-pve.patch` (the relay) and
+`patch/kernel-timer-guard-pve.patch` (the timer-storm guard) are the current
+PVE-form diffs (cap `0x4f564d52`), provided as point-in-time snapshots. The build
+script (`build/kvm_patch_apply_hcall_relay.sh`) remains the source of truth for
+what gets applied: it inserts the relay by anchored text edits that track
+point-release drift where a static patch would not, and applies the guard patch
+when `GUARD=1`. The mainline-form patches (the upstream RFC, cap 249) are at
 `github.com/bitranox/linux-nested-vmbus-relay` on branch `nested-vmbus-relay`.
 
 ## Design
