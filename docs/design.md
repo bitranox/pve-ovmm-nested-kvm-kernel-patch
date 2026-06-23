@@ -228,4 +228,4 @@ operation; the faulting vCPU cannot flush mid-hypercall.
 | Repo | What it is |
 |------|-----------|
 | [github.com/bitranox/linux-nested-vmbus-relay](https://github.com/bitranox/linux-nested-vmbus-relay) | Fork of `kvm-x86/linux`, branch `nested-vmbus-relay`: the mainline RFC form as a single commit on top of `kvm-x86/next`. |
-| [github.com/bitranox/pve-nested-vmbus-relay](https://github.com/bitranox/pve-nested-vmbus-relay) | Proxmox VE kernel variant: a build script (anchored text insertions) plus this design doc, not a fork. |
+| [github.com/bitranox/pve-ovmm-nested-kvm-kernel-patch](https://github.com/bitranox/pve-ovmm-nested-kvm-kernel-patch) | Proxmox VE kernel variant: a build script (anchored text insertions) plus this design doc, not a fork. |
