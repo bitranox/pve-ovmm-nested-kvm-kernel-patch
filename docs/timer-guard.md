@@ -31,16 +31,20 @@ The root partition uses a direct-mode auto-enable one-shot synthetic timer as a
 short spin-delay. It arms a deadline a few hundred microseconds out, takes the
 direct interrupt when it expires, and re-arms the same deadline.
 
-KVM's synthetic reference clock reads vCPU0's TSC for every vCPU
-(`get_time_ref_counter()`). On a host without VMX TSC scaling
-(`!kvm_caps.has_tsc_control`) the per-vCPU TSC phase cannot be made exact, so the
-arming vCPU can read its own legitimate near-future deadline as already in the
-past. Per TLFS v4 section 15.3.1, a past-dated one-shot expires immediately, so
-KVM marks it pending with zero delay. The guest takes the interrupt, EOIs, and
-the auto-enable re-arms the same past deadline. The timer then fires in a tight
-loop that pegs the vCPU in VM-exit handling, so the spin-wait never advances and
-the guest hangs. The reference-counter rate is exactly correct; only the per-vCPU
-phase is off, which is why the hang is intermittent.
+By the time KVM evaluates the armed deadline (in `stimer_start()`), it is already
+in the past, so per TLFS v4 section 15.3.1 the one-shot expires immediately: KVM
+marks it pending with zero delay, the guest EOIs, the auto-enable re-arms the same
+deadline, and the timer fires in a tight loop that pegs the vCPU in VM-exit
+handling so the spin-wait never advances and the guest hangs (~96k re-arms/s/vCPU).
+
+This is not a clock error. The per-vCPU TSC offsets are synchronized (measured:
+identical across all vCPUs) and the Hyper-V reference TSC page tracks kvmclock to
+under a microsecond (measured, both idle and under nested load), so the reference
+counter the guest reads is accurate; forcing KVM's internal counter onto kvmclock
+does not stop the storm either. The deadline is genuinely past, not skewed: the
+near-term spin-delay outruns the nested arm-and-evaluate round-trip. It is seen
+only on hosts without VMX TSC scaling, so the guard is gated on
+`!kvm_caps.has_tsc_control`.
 
 This is in-kernel KVM emulation. The synthetic timer fires entirely inside KVM
 (the SynIC timer code), with no userspace exit on the fire path, so a userspace
@@ -73,8 +77,8 @@ loop is slowed.
 ## The TSC-scaling gate
 
 The guard is gated on `!kvm_caps.has_tsc_control`. On a TSC-scaling host that
-capability is set, the gate is false, the per-vCPU phase is exact, the loop never
-forms, and the guarded branch is never entered. So the guard has no effect and no
+capability is set, the gate is false, the loop never forms, and the guarded
+branch is never entered. So the guard has no effect and no
 cost on a modern CPU, whether or not it is enabled. It does anything only on the
 older hosts where the storm is possible.
 
